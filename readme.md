@@ -164,4 +164,4 @@ needs a metric-trained model, which is a different checkpoint.
 | `style.css` | all styling |
 | `app.js` | capture, upload, colour ramps, wipe compare |
 | `modal_app.py` | GPU backend, the only file that touches your model |
-| `examples/` | precomputed pairs for the offline fallback |
+| `examples/` | precomputed pairs for the offline fallback |# depth-estimation-
