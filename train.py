@@ -40,7 +40,7 @@ CFG = {
     "grad_accum": 8,
     "lr": 3e-5,
     "warmup": 100,
-    "max_steps": 2000,
+    "max_steps": 4000,
     "val_every": 250,
     "ckpt_every": 500,
     "multires_noise": True,
