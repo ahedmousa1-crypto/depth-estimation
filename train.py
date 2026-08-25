@@ -1,18 +1,33 @@
 """
-Marigold-style monocular depth fine-tuning on Modal.
-Paper: "Repurposing Diffusion-Based Image Generators for Monocular Depth Estimation"
-(Ke et al., CVPR 2024) -- arXiv:2312.02145
+Monocular metric depth fine-tuning on Modal.
 
-Protocol reproduced here:
-  * backbone: Stable Diffusion 2 (768-v) -> v-objective, NOT epsilon
+Backbone protocol follows Ke et al., CVPR 2024 ("Repurposing Diffusion-Based
+Image Generators for Monocular Depth Estimation", arXiv:2312.02145):
+  * backbone: Stable Diffusion 1.5
   * VAE + text encoder frozen; only the denoising UNet is trained
-  * UNet conv_in expanded 4 -> 8 channels (RGB latent || noisy depth latent),
+  * UNet conv_in expanded 4 -> 8 channels (RGB latent || depth-RGB latent),
     duplicated weights scaled by 0.5 to preserve activation magnitude
-  * depth: affine-invariant normalization to [-1, 1] using 2nd/98th
-    percentiles, then replicated to 3 channels before VAE encoding
   * text conditioning disabled (single cached empty-prompt embedding)
-  * train: DDPM 1000 steps, Adam 3e-5, effective batch 32, h-flip aug
+  * train: DDPM 1000 steps, epsilon-prediction, Adam 3e-5, effective batch 16, h-flip aug
   * infer: DDIM 50 steps, 10-member ensemble
+
+Depth representation follows "Image Generators are Generalist Vision
+Learners" (Vision Banana, Gabeur et al. 2026), Sec. 3.2: instead of an
+affine-invariant grayscale target, ground-truth metric depth (meters) is
+encoded as an RGB image via a bijection (see depth_codec.py):
+  1. Barron 2025 power transform, lambda=-3, c=10/3, warps d in [0, inf)
+     to a curved distance t in [0, 1).
+  2. t selects a position along a 7-edge path across the RGB cube's 8
+     corners, black -> white.
+This makes the training target and the model's output an ordinary RGB
+image (so it VAE-encodes/decodes like any other picture) while remaining
+exactly invertible back to metric depth -- no affine-invariant rescaling,
+no per-image normalization, no post-hoc alignment at eval time.
+
+Dataset assumption (see CFG["depth_png_scale"]): the `depth` column holds
+a 16-bit single-channel PNG in centimeters (uint16, so 0-655.35 m range).
+If the DIODE-derived HF dataset stores depth differently (e.g. raw float32
+meters), change _depth_png_to_meters() and depth_png_scale accordingly.
 
 Usage:
     modal run train.py::inspect      # ALWAYS run this first
@@ -27,32 +42,59 @@ import modal
 # Config -- edit here, nothing else.
 # -------------------------------------------------------------------------
 CFG = {
-    "model_id": "stable-diffusion-v1-5/stable-diffusion-v1-5",  # 768-v checkpoint (vprediction)
-    "dataset": "ahd03/nyu-depth-controlnet",
+    # Model
+    "model_id": "stable-diffusion-v1-5/stable-diffusion-v1-5",
+
+    # Dataset -- DIODE 3K on HuggingFace
+    "dataset": "ahd03/diode-depth-3k",
     "dataset_split": "train",
-    "rgb_col": "conditioning_image",
-    "depth_col": "image",
-    "proc_h": 480,
+    "rgb_col": "image",    # column name in your HF dataset
+    "depth_col": "depth",  # column name in your HF dataset
+
+    # Metric depth is stored as a 16-bit PNG scaled by this factor
+    # (default: centimeters, so meters = pixel_value / 100.0).
+    "depth_png_scale": 100.0,
+
+    # Resolution -- 640x640 is above SD1.5's native 512 but fits on L40S.
+    # If you get OOM errors, drop to 512 and set micro_batch to 4.
+    "proc_h": 640,
     "proc_w": 640,
+
+    # Train/val split -- 10% held out for validation (200 images)
     "val_frac": 0.10,
     "seed": 42,
+
+    # Batch:
+    #   micro_batch = images processed on GPU at once (limited by VRAM)
+    #   grad_accum  = how many micro batches before a weight update
+    #   effective batch = micro_batch x grad_accum = 2 x 8 = 16
     "micro_batch": 2,
     "grad_accum": 8,
+
+    # Optimizer
     "lr": 3e-5,
-    "warmup": 100,
-    "max_steps": 4000,
-    "val_every": 250,
-    "ckpt_every": 500,
-    "multires_noise": True,
+    "warmup": 200,
+    "max_steps": 10000,
+
+    # Logging / checkpointing
+    "val_every": 500,
+    "ckpt_every": 1000,
+
+    # Misc training options
+    "multires_noise": False,
     "use_8bit_adam": False,
+
+    # Inference / evaluation
     "ddim_steps": 50,
     "ensemble": 10,
-    "eval_limit": 66,
-    "hub_repo": "ahd03/nyu-depth-marigoldmodel",
+    "eval_limit": 100,
+
+    # Where to push the final model
+    "hub_repo": "ahd03/diode-depth-model-v2",
 }
 
 GPU = "L40S"
-app = modal.App("marigold-depth-training")
+app = modal.App("depth-estimation-training")
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -73,45 +115,57 @@ image = (
         "tqdm",
     )
     .env({"HF_HOME": "/cache/hf"})
+    # Ships depth_codec.py into the container so the bijective encode/decode
+    # is defined in exactly one place, shared with local testing.
+    .add_local_python_source("depth_codec", copy=True)
 )
 
-out_vol = modal.Volume.from_name("marigoldoutput", create_if_missing=True)
-cache_vol = modal.Volume.from_name("marigold-cache", create_if_missing=True)
+out_vol = modal.Volume.from_name("depth-estimation-output", create_if_missing=True)
+cache_vol = modal.Volume.from_name("depth-estimation-cache", create_if_missing=True)
 VOLUMES = {"/output": out_vol, "/cache": cache_vol}
 SECRETS = [modal.Secret.from_name("huggingface-secret2")]
 
 
 # =========================================================================
-# Shared helpers (defined at module level, imported inside functions)
+# Shared helpers
 # =========================================================================
 def _build_helpers():
     import numpy as np
     import torch
     import torch.nn.functional as F
     from PIL import Image
-
-    def to_gray_array(pil_img):
-        return np.asarray(pil_img.convert("L"), dtype=np.float32) / 255.0
-
-    def affine_invariant_norm(depth, lo=2.0, hi=98.0):
-        valid = depth > 0
-        if valid.sum() < 64:
-            valid = np.ones_like(depth, dtype=bool)
-        d2, d98 = np.percentile(depth[valid], [lo, hi])
-        scale = max(float(d98 - d2), 1e-6)
-        out = (depth - d2) / scale * 2.0 - 1.0
-        return np.clip(out, -1.0, 1.0).astype(np.float32)
+    import depth_codec
 
     def rgb_to_tensor(pil_img, h, w):
         img = pil_img.convert("RGB").resize((w, h), Image.BILINEAR)
         arr = np.asarray(img, dtype=np.float32) / 127.5 - 1.0
         return torch.from_numpy(arr).permute(2, 0, 1)
 
+    def depth_png_to_meters(pil_img, h, w, scale=CFG["depth_png_scale"]):
+        """16-bit single-channel PNG -> metric depth array (H, W), meters."""
+        d = pil_img.resize((w, h), Image.NEAREST)
+        arr = np.asarray(d, dtype=np.float32)
+        if arr.ndim == 3:  # some encoders write 16-bit depth as I;16 -> 'L' fallback
+            arr = arr[..., 0]
+        return arr / scale
+
     def depth_to_tensor(pil_img, h, w):
-        d = pil_img.convert("L").resize((w, h), Image.NEAREST)
-        d = np.asarray(d, dtype=np.float32) / 255.0
-        d = affine_invariant_norm(d)
-        return torch.from_numpy(d).unsqueeze(0).repeat(3, 1, 1)
+        """Ground-truth metric depth (meters) -> bijective RGB target in
+        [-1, 1], ready for the VAE, via depth_codec.depth_to_rgb."""
+        meters = depth_png_to_meters(pil_img, h, w)
+        rgb01 = depth_codec.depth_to_rgb(meters)  # (H, W, 3) in [0, 1]
+        rgb = rgb01.astype(np.float32) * 2.0 - 1.0
+        return torch.from_numpy(rgb).permute(2, 0, 1)
+
+    def depth_tensor_to_meters(t):
+        """Inverse of depth_to_tensor. t: (3, H, W) tensor/array in [-1, 1]
+        (or a numpy array shaped (H, W, 3) in [0, 1]) -> meters (H, W)."""
+        if torch.is_tensor(t):
+            arr = t.permute(1, 2, 0).cpu().numpy()
+            rgb01 = np.clip((arr + 1.0) / 2.0, 0.0, 1.0)
+        else:
+            rgb01 = np.clip(t, 0.0, 1.0)
+        return depth_codec.rgb_to_depth(rgb01)
 
     def multires_noise(latents, timesteps, num_train_ts, strength=0.9):
         b, c, h, w = latents.shape
@@ -131,32 +185,25 @@ def _build_helpers():
                 break
         return noise / noise.std(dim=(1, 2, 3), keepdim=True)
 
-    def align_least_squares(pred, gt, mask):
-        p, g = pred[mask], gt[mask]
-        A = np.stack([p, np.ones_like(p)], axis=1)
-        s, t = np.linalg.lstsq(A, g, rcond=None)[0]
-        return pred * s + t
-
-    def depth_metrics(pred, gt, mask):
-        pred = np.clip(pred, 1e-6, None)
-        gt_v, pr_v = gt[mask], pred[mask]
-        absrel = float(np.mean(np.abs(pr_v - gt_v) / np.clip(gt_v, 1e-6, None)))
-        ratio = np.maximum(
-            pr_v / np.clip(gt_v, 1e-6, None), gt_v / np.clip(pr_v, 1e-6, None)
-        )
+    def depth_metrics(pred_m, gt_m, mask):
+        """Direct metric-space comparison, no scale/shift alignment --
+        the codec is trained to predict absolute depth, so alignment would
+        hide exactly the error we care about."""
+        pred_v = np.clip(pred_m[mask], 1e-6, None)
+        gt_v = np.clip(gt_m[mask], 1e-6, None)
+        absrel = float(np.mean(np.abs(pred_v - gt_v) / gt_v))
+        ratio = np.maximum(pred_v / gt_v, gt_v / pred_v)
         return {
             "absrel": absrel,
             "delta1": float(np.mean(ratio < 1.25)),
-            "rmse": float(np.sqrt(np.mean((pr_v - gt_v) ** 2))),
+            "rmse": float(np.sqrt(np.mean((pred_v - gt_v) ** 2))),
         }
 
     return dict(
-        to_gray_array=to_gray_array,
-        affine_invariant_norm=affine_invariant_norm,
         rgb_to_tensor=rgb_to_tensor,
         depth_to_tensor=depth_to_tensor,
+        depth_tensor_to_meters=depth_tensor_to_meters,
         multires_noise=multires_noise,
-        align_least_squares=align_least_squares,
         depth_metrics=depth_metrics,
     )
 
@@ -185,12 +232,6 @@ def _detect_columns(ds):
 
     depth_col = min(scores, key=scores.get)
     rgb_col = max(scores, key=scores.get)
-
-    if scores[depth_col] > 3.0:
-        print(f"!! channel-variance heuristic inconclusive: {scores}")
-        print("!! falling back to ControlNet convention.")
-        rgb_col, depth_col = "conditioning_image", "image"
-
     print(f"columns -> rgb={rgb_col}  depth={depth_col}  (variance {scores})")
     return rgb_col, depth_col
 
@@ -208,6 +249,8 @@ def _load_models(device, train_mode=True):
 
     vae.requires_grad_(False)
 
+    # Expand conv_in from 4 to 8 channels to accept
+    # concatenated [RGB latent | noisy depth-RGB latent]
     old = unet.conv_in
     if old.in_channels == 4:
         new = torch.nn.Conv2d(
@@ -293,7 +336,8 @@ def _encode(vae, x):
 
 
 # =========================================================================
-# 1. Inspect the dataset -- run this BEFORE training
+# 1. Inspect the dataset -- run this BEFORE training to verify columns
+#    and depth value ranges look correct
 # =========================================================================
 @app.function(image=image, volumes=VOLUMES, secrets=SECRETS, timeout=1800)
 def inspect():
@@ -305,16 +349,27 @@ def inspect():
     print(f"features = {ds.features}")
     rgb_col, depth_col = _detect_columns(ds)
 
-    for col in (rgb_col, depth_col):
-        im = ds[0][col]
-        a = np.asarray(im.convert("L"), dtype=np.float32)
-        print(
-            f"{col}: mode={im.mode} size={im.size} "
-            f"min={a.min():.0f} max={a.max():.0f} "
-            f"zeros={(a == 0).mean():.3f}"
-        )
+    im = ds[0][rgb_col]
+    print(f"{rgb_col}: mode={im.mode} size={im.size}")
 
-    print("\nIf rgb/depth look swapped, set CFG['rgb_col'] / CFG['depth_col'].")
+    dep = ds[0][depth_col]
+    arr = np.asarray(dep, dtype=np.float32)
+    meters = arr / CFG["depth_png_scale"]
+    print(
+        f"{depth_col}: mode={dep.mode} size={dep.size} "
+        f"raw min={arr.min():.0f} raw max={arr.max():.0f} "
+        f"-> meters min={meters.min():.3f} max={meters.max():.3f} "
+        f"zeros={(arr == 0).mean():.3f}"
+    )
+    print(
+        "\nSanity check: does 'meters max' look like a plausible DIODE depth "
+        "(indoor: tens of meters, outdoor: up to a few hundred)?"
+    )
+    print(
+        "If min/max look wrong, CFG['depth_png_scale'] does not match how "
+        "the Colab dataset-builder encoded depth -- fix it before training."
+    )
+    print("If rgb/depth look swapped, fix CFG['rgb_col'] / CFG['depth_col'].")
     cache_vol.commit()
 
 
@@ -345,11 +400,22 @@ def train():
 
     vae, unet, sched, empty_embed = _load_models(device, train_mode=True)
     n_train_ts = sched.config.num_train_timesteps
-    pred_type = sched.config.prediction_type
 
     train_ds, val_ds = _make_datasets(H)
-    dl = DataLoader(train_ds, batch_size=CFG["micro_batch"], shuffle=True, num_workers=2)
-    vdl = DataLoader(val_ds, batch_size=CFG["micro_batch"], shuffle=False, num_workers=2)
+    dl = DataLoader(
+        train_ds,
+        batch_size=CFG["micro_batch"],
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True,
+    )
+    vdl = DataLoader(
+        val_ds,
+        batch_size=CFG["micro_batch"],
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True,
+    )
 
     if CFG["use_8bit_adam"]:
         import bitsandbytes as bnb
@@ -389,11 +455,7 @@ def train():
             noise = torch.randn(z_dep.shape, device=device, generator=gen)
 
         noisy = sched.add_noise(z_dep, noise, ts)
-        target = (
-            sched.get_velocity(z_dep, noise, ts)
-            if pred_type == "v_prediction"
-            else noise
-        )
+        target = noise  # SD1.5 uses epsilon-prediction
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
             out = unet(
@@ -418,14 +480,23 @@ def train():
     def save(tag):
         unet.save_pretrained(f"/output/{tag}")
         torch.save(
-            {"unet": unet.state_dict(), "opt": opt.state_dict(),
-             "sched": lr_sched.state_dict(), "step": step},
+            {
+                "unet": unet.state_dict(),
+                "opt": opt.state_dict(),
+                "sched": lr_sched.state_dict(),
+                "step": step,
+            },
             ck,
         )
         out_vol.commit()
 
-    print(f"training: {CFG['max_steps']} optimizer steps "
-          f"(micro {CFG['micro_batch']} x accum {CFG['grad_accum']})")
+    print(
+        f"training: {CFG['max_steps']} steps | "
+        f"micro_batch {CFG['micro_batch']} x grad_accum {CFG['grad_accum']} "
+        f"= effective batch {CFG['micro_batch'] * CFG['grad_accum']} | "
+        f"resolution {CFG['proc_h']}x{CFG['proc_w']}"
+    )
+
     best, t0, accum = float("inf"), time.time(), 0
     opt.zero_grad(set_to_none=True)
     done = False
@@ -447,10 +518,13 @@ def train():
 
             if step % 20 == 0:
                 el = time.time() - t0
-                print(f"step {step}/{CFG['max_steps']} "
-                      f"loss {loss.item() * CFG['grad_accum']:.4f} "
-                      f"lr {lr_sched.get_last_lr()[0]:.2e} "
-                      f"{el / max(step, 1):.1f}s/step", flush=True)
+                print(
+                    f"step {step}/{CFG['max_steps']} "
+                    f"loss {loss.item() * CFG['grad_accum']:.4f} "
+                    f"lr {lr_sched.get_last_lr()[0]:.2e} "
+                    f"{el / max(step, 1):.1f}s/step",
+                    flush=True,
+                )
 
             if step % CFG["val_every"] == 0:
                 vl = validate()
@@ -473,7 +547,9 @@ def train():
 
 
 # =========================================================================
-# 3. Evaluate -- DDIM sampling + ensembling + affine-invariant metrics
+# 3. Evaluate -- DDIM sampling + ensemble, decoded to metric depth via the
+#    bijective codec. No least-squares alignment: this is a true zero-shot
+#    metric-depth evaluation, matching the Vision Banana protocol.
 # =========================================================================
 @app.function(
     image=image,
@@ -484,7 +560,6 @@ def train():
 )
 def evaluate(ckpt: str = "unet_best"):
     import os
-
     import numpy as np
     import torch
     from diffusers import DDIMScheduler, UNet2DConditionModel
@@ -499,7 +574,7 @@ def evaluate(ckpt: str = "unet_best"):
         unet = UNet2DConditionModel.from_pretrained(path).to(device).eval()
         print(f"loaded {path}")
     else:
-        print(f"!! {path} not found -- evaluating the un-finetuned baseline")
+        print(f"!! {path} not found -- evaluating un-finetuned baseline")
 
     ddim = DDIMScheduler.from_pretrained(CFG["model_id"], subfolder="scheduler")
     ddim.set_timesteps(CFG["ddim_steps"], device=device)
@@ -508,7 +583,10 @@ def evaluate(ckpt: str = "unet_best"):
     os.makedirs("/output/preds", exist_ok=True)
 
     @torch.no_grad()
-    def predict(img_t):
+    def predict_rgb01(img_t):
+        """Returns the ensemble-averaged predicted depth-RGB image in
+        [0, 1], shape (H, W, 3) -- averaging happens in RGB space, then a
+        single codec decode recovers metric depth."""
         z_img = _encode(vae, img_t.unsqueeze(0).to(device))
         members = []
         for k in range(CFG["ensemble"]):
@@ -522,42 +600,43 @@ def evaluate(ckpt: str = "unet_best"):
                         encoder_hidden_states=empty_embed,
                     ).sample
                 z = ddim.step(out.float(), t, z).prev_sample
-            d = vae.decode(z / vae.config.scaling_factor).sample
-            d = d.mean(dim=1).squeeze(0)
-            members.append(((d + 1.0) / 2.0).clamp(0, 1).cpu().numpy())
-
-        ref = members[0]
-        m = np.ones_like(ref, dtype=bool)
-        aligned = [ref] + [
-            H["align_least_squares"](x, ref, m) for x in members[1:]
-        ]
-        return np.clip(np.mean(aligned, axis=0), 0, 1)
+            d = vae.decode(z / vae.config.scaling_factor).sample.squeeze(0)  # (3,H,W)
+            rgb01 = ((d + 1.0) / 2.0).clamp(0, 1).permute(1, 2, 0).cpu().numpy()
+            members.append(rgb01)
+        return np.clip(np.mean(members, axis=0), 0, 1)
 
     scores = []
     for i in range(min(CFG["eval_limit"], len(val_ds))):
         img_t, dep_t = val_ds[i]
-        pred = predict(img_t)
-        gt = (dep_t[0].numpy() + 1.0) / 2.0
-        mask = gt > 1e-3
-        pred_a = H["align_least_squares"](pred, gt, mask)
-        scores.append(H["depth_metrics"](pred_a, gt, mask))
+        pred_rgb01 = predict_rgb01(img_t)
+        pred_m = H["depth_tensor_to_meters"](pred_rgb01)
+        gt_m = H["depth_tensor_to_meters"](dep_t)
+
+        mask = gt_m > 1e-3
+        scores.append(H["depth_metrics"](pred_m, gt_m, mask))
+
         if i < 8:
-            Image.fromarray((pred * 255).astype(np.uint8)).save(
-                f"/output/preds/{i:03d}_pred.png"
+            Image.fromarray((pred_rgb01 * 255).astype(np.uint8)).save(
+                f"/output/preds/{i:03d}_pred_rgb.png"
             )
-            Image.fromarray((gt * 255).astype(np.uint8)).save(
-                f"/output/preds/{i:03d}_gt.png"
+            gt_rgb01 = ((dep_t.permute(1, 2, 0).numpy() + 1.0) / 2.0).clip(0, 1)
+            Image.fromarray((gt_rgb01 * 255).astype(np.uint8)).save(
+                f"/output/preds/{i:03d}_gt_rgb.png"
+            )
+            rgb_np = (img_t.permute(1, 2, 0).numpy() * 0.5 + 0.5) * 255
+            Image.fromarray(rgb_np.astype(np.uint8)).save(
+                f"/output/preds/{i:03d}_rgb.png"
             )
 
     agg = {k: float(np.mean([s[k] for s in scores])) for k in scores[0]}
     print(f"\nn={len(scores)}  " + "  ".join(f"{k}={v:.4f}" for k, v in agg.items()))
-    print("NOTE: metrics are vs the 8-bit depth PNGs, not metric NYU depth.")
+    print("Metrics are direct metric-depth comparisons (meters), no alignment applied.")
     out_vol.commit()
     return agg
 
 
 # =========================================================================
-# 4. Push to the Hub (separate step -- never inside the training loop)
+# 4. Push to HuggingFace Hub
 # =========================================================================
 @app.function(image=image, volumes=VOLUMES, secrets=SECRETS, timeout=3600)
 def push(ckpt: str = "unet_best"):
@@ -567,8 +646,8 @@ def push(ckpt: str = "unet_best"):
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     if not token:
         raise RuntimeError(
-            "No HF token in the 'huggingface-secret' Modal secret. "
-            "Add a key named HF_TOKEN."
+            "No HF token found in Modal secret. "
+            "Add a key named HF_TOKEN to your huggingface-secret2 secret."
         )
 
     api = HfApi(token=token)

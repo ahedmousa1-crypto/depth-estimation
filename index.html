@@ -22,7 +22,7 @@
 
   <header class="masthead">
     <p class="eyebrow">Monocular depth estimation</p>
-    <h1>One camera.<br>No stereo pair.<br><em>Distance anyway.</em></h1>
+    <h1>Judging distance from a single photograph.</h1>
     <p class="standfirst">
       A single photograph carries no direct measurement of distance. The model infers it
       from the cues a person uses without thinking: things that overlap sit in front,
@@ -99,6 +99,7 @@
       <div><dt>Round trip</dt><dd id="mTotal">—</dd></div>
       <div><dt>Resolution</dt><dd id="mRes">—</dd></div>
       <div><dt>Device</dt><dd id="mDev">—</dd></div>
+      <div id="rangeRow" hidden><dt>Depth range</dt><dd id="mRange">—</dd></div>
     </dl>
 
   </section>
@@ -106,9 +107,9 @@
   <section class="notes">
     <h2>Reading the output</h2>
     <div class="notes-grid">
-      <article>
-        <h3>It is relative, not metric</h3>
-        <p>
+      <article id="scaleNote">
+        <h3 id="scaleNoteTitle">It is relative, not metric</h3>
+        <p id="scaleNoteBody">
           The model predicts inverse relative depth. Bright means nearer and dark means
           further, but the scale is normalised per image. Nothing here tells you that a
           chair is 2.3 metres away, and two different photos are not comparable to each

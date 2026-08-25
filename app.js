@@ -4,8 +4,8 @@
    ============================================================ */
 
    const CONFIG = {
-    // Paste the URL Modal prints when you run `modal deploy modal_app.py`
-    ENDPOINT: 'https://YOUR-WORKSPACE--depth-demo-web.modal.run/predict',
+    
+    ENDPOINT: 'https://modal.com/apps/ahed-mousa1/main/deployed/depth-demo',
   
     // Optional shared token. Must match SHARED_TOKEN in modal_app.py.
     // Visible to anyone who opens devtools, so it deters crawlers, nothing more.
@@ -69,6 +69,27 @@
     mTotal:     document.getElementById('mTotal'),
     mRes:       document.getElementById('mRes'),
     mDev:       document.getElementById('mDev'),
+    rangeRow:   document.getElementById('rangeRow'),
+    mRange:     document.getElementById('mRange'),
+    scaleNoteTitle: document.getElementById('scaleNoteTitle'),
+    scaleNoteBody:  document.getElementById('scaleNoteBody'),
+  };
+
+  const SCALE_NOTE = {
+    relative: {
+      title: 'It is relative, not metric',
+      body: 'The model predicts inverse relative depth. Bright means nearer and dark means '
+          + 'further, but the scale is normalised per image. Nothing here tells you that a '
+          + 'chair is 2.3 metres away, and two different photos are not comparable to each '
+          + 'other. Absolute distance in metres requires a metric-trained variant.',
+    },
+    metric: {
+      title: 'It is metric, in metres',
+      body: 'This model was trained to predict absolute distance, not just relative order. '
+          + 'The depth range shown below is in real metres, estimated from the photo alone '
+          + '— no stereo pair, no camera calibration. Accuracy still degrades on the same '
+          + 'hard cases as any monocular model: mirrors, glass, texture-less walls, motion blur.',
+    },
   };
   
   const state = {
@@ -86,6 +107,12 @@
   function setStatus(text, tone = '') {
     el.statusText.textContent = text;
     el.status.dataset.tone = tone;
+  }
+
+  function applyScaleMode(isMetric) {
+    const note = isMetric ? SCALE_NOTE.metric : SCALE_NOTE.relative;
+    el.scaleNoteTitle.textContent = note.title;
+    el.scaleNoteBody.textContent = note.body;
   }
   
   /* ---------- input handling ---------- */
@@ -175,6 +202,11 @@
     state.busy = true;
     el.scan.hidden = false;
     el.downloadBtn.disabled = true;
+    el.readout.hidden = true;
+    // Any depth map already on screen belongs to a previous photo. Hide it
+    // now rather than leave it visible (and wrongly implied to match the
+    // new photo) while this request is in flight or if it fails.
+    el.compare.classList.add('pending');
     setStatus('Sending to the GPU\u2026', 'busy');
   
     const started = performance.now();
@@ -200,11 +232,18 @@
   
       const data = await res.json();
       await renderDepth(data);
-  
+
       const total = Math.round(performance.now() - started);
       el.mInfer.textContent = data.inference_ms != null ? `${Math.round(data.inference_ms)} ms` : '\u2014';
       el.mTotal.textContent = `${total} ms`;
       el.mDev.textContent = data.device || '\u2014';
+      applyScaleMode(data.metric === true);
+      if (data.metric && data.depth_min_m != null && data.depth_max_m != null) {
+        el.mRange.textContent = `${data.depth_min_m.toFixed(2)}\u2013${data.depth_max_m.toFixed(2)} m`;
+        el.rangeRow.hidden = false;
+      } else {
+        el.rangeRow.hidden = true;
+      }
       el.readout.hidden = false;
       el.downloadBtn.disabled = false;
       setStatus('Depth map ready. Drag the divider to compare.', 'ok');
@@ -244,8 +283,9 @@
     state.gray = gray;
     state.w = img.width;
     state.h = img.height;
-  
+
     paint();
+    el.compare.classList.remove('pending');
   }
   
   function paint() {
@@ -375,11 +415,14 @@
       state.w = depth.width;
       state.h = depth.height;
       paint();
-  
+      el.compare.classList.remove('pending');
+
       el.mRes.textContent = `${photo.naturalWidth}\u00D7${photo.naturalHeight}`;
       el.mInfer.textContent = 'precomputed';
       el.mTotal.textContent = '\u2014';
       el.mDev.textContent = 'bundled';
+      applyScaleMode(false);
+      el.rangeRow.hidden = true;
       el.readout.hidden = false;
       el.downloadBtn.disabled = false;
       setStatus(`Example: ${ex.label || ex.photo}. No GPU call was made.`, 'ok');
