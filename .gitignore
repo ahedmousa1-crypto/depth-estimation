@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+
+synthetic_nav_data/three.min.js
+synthetic_nav_data/generated_samples/
+synthetic_nav_data/*_out*/

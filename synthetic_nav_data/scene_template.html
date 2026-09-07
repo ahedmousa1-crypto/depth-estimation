@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><style>html,body{margin:0;padding:0;}</style></head>
+<body>
+<script id="scene-data" type="application/json">__SCENE_JSON__</script>
+<script src="three.min.js"></script>
+<script>
+const SCENE = JSON.parse(document.getElementById('scene-data').textContent);
+const W = 640, H = 480;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setSize(W, H);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87ceeb);
+scene.fog = new THREE.Fog(0x87ceeb, 15, 40);
+
+const camera = new THREE.PerspectiveCamera(70, W / H, 0.1, 100);
+
+const hemi = new THREE.HemisphereLight(0xffffff, 0x3a3a3a, 1.1);
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffffff, 0.9);
+sun.position.set(4, 6, 3);
+scene.add(sun);
+
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(80, 80),
+  new THREE.MeshStandardMaterial({ color: 0x4caf50 })
+);
+ground.rotation.x = -Math.PI / 2;
+scene.add(ground);
+
+function makeGeom(shape) {
+  switch (shape) {
+    case "cone": return new THREE.ConeGeometry(0.5, 1.2, 32);
+    case "cube": return new THREE.BoxGeometry(0.8, 0.8, 0.8);
+    case "sphere": return new THREE.SphereGeometry(0.45, 32, 32);
+    case "cylinder": return new THREE.CylinderGeometry(0.4, 0.4, 1.0, 32);
+  }
+}
+
+const meshesById = {};
+for (const o of SCENE.objects) {
+  const mesh = new THREE.Mesh(makeGeom(o.shape), new THREE.MeshStandardMaterial({ color: o.color_hex }));
+  mesh.position.set(o.position[0], o.position[1], o.position[2]);
+  scene.add(mesh);
+  meshesById[o.id] = mesh;
+}
+
+function headingToQuat(deg) {
+  // Must match scene_gen.py's _rot_y exactly: x'=x*cos+z*sin, z'=-x*sin+z*cos
+  // applied to the forward vector (0,0,-1). Empirically verified against the
+  // rendered trace (see synth_gen dev notes) -- do not flip this sign again
+  // without re-checking a rendered sample.
+  const rad = THREE.MathUtils.degToRad(deg);
+  const q = new THREE.Quaternion();
+  q.setFromAxisAngle(new THREE.Vector3(0, 1, 0), rad);
+  return q;
+}
+
+function setCameraAtWaypoint(i) {
+  const wp = SCENE.waypoints[i];
+  const heading = SCENE.headings[i];
+  camera.position.set(wp[0], wp[1], wp[2]);
+  camera.quaternion.copy(headingToQuat(heading));
+}
+
+function projectToPixels(worldPos) {
+  const v = new THREE.Vector3(worldPos[0], worldPos[1], worldPos[2]);
+  // view-space forward distance (camera looks down its local -z)
+  const viewSpace = v.clone().applyMatrix4(camera.matrixWorldInverse);
+  if (viewSpace.z > -0.2) {
+    // degenerate: point is at/behind the camera's near plane (e.g. directly
+    // below the camera at the path's own start) -- represent as "at the
+    // viewer's feet", the conventional trace-start pixel.
+    return [W / 2, H, 0];
+  }
+  v.project(camera);
+  return [ (v.x * 0.5 + 0.5) * W, (1 - (v.y * 0.5 + 0.5)) * H, v.z ];
+}
+
+window.__renderFrame = function(waypointIndex) {
+  setCameraAtWaypoint(waypointIndex);
+  renderer.render(scene, camera);
+  return renderer.domElement.toDataURL("image/png");
+};
+
+window.__projectWaypointsFrom = function(cameraWaypointIndex) {
+  setCameraAtWaypoint(cameraWaypointIndex);
+  camera.updateMatrixWorld(true);
+  return SCENE.waypoints_ground.map(projectToPixels);
+};
+
+window.__projectObjectsFrom = function(cameraWaypointIndex) {
+  setCameraAtWaypoint(cameraWaypointIndex);
+  camera.updateMatrixWorld(true);
+  const out = {};
+  for (const o of SCENE.objects) out[o.id] = projectToPixels(o.position);
+  return out;
+};
+
+window.__SCENE_READY__ = true;
+</script>
+</body>
+</html>
