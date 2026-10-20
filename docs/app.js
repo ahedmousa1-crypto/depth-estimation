@@ -4,8 +4,9 @@
    ============================================================ */
 
    const CONFIG = {
-    
-    ENDPOINT: 'https://modal.com/apps/ahed-mousa1/main/deployed/depth-demo',
+    // The deployed web endpoint, not the modal.com dashboard page. `modal deploy`
+    // prints it; the pattern is https://<workspace>--depth-demo-depthservice-web.modal.run
+    ENDPOINT: 'https://ahed-mousa1--depth-demo-depthservice-web.modal.run/predict',
   
     // Optional shared token. Must match SHARED_TOKEN in modal_app.py.
     // Visible to anyone who opens devtools, so it deters crawlers, nothing more.
@@ -73,6 +74,10 @@
     mRange:     document.getElementById('mRange'),
     scaleNoteTitle: document.getElementById('scaleNoteTitle'),
     scaleNoteBody:  document.getElementById('scaleNoteBody'),
+    legend:     document.getElementById('legend'),
+    legendBar:  document.getElementById('legendBar'),
+    legendNear: document.getElementById('legendNear'),
+    legendFar:  document.getElementById('legendFar'),
   };
 
   const SCALE_NOTE = {
@@ -114,6 +119,18 @@
     el.scaleNoteTitle.textContent = note.title;
     el.scaleNoteBody.textContent = note.body;
   }
+
+  /* Near is bright, so the legend runs from the top of the ramp down.
+     Pass a metric range to label the ends in metres. */
+  function updateLegend(range) {
+    const stops = [...RAMPS[state.ramp]].reverse().join(', ');
+    el.legendBar.style.setProperty('--legend', `linear-gradient(90deg, ${stops})`);
+    if (range !== undefined) {
+      el.legendNear.textContent = range ? `near · ${range[0].toFixed(2)} m` : 'near';
+      el.legendFar.textContent  = range ? `${range[1].toFixed(2)} m · far` : 'far';
+    }
+    el.legend.hidden = !state.gray;
+  }
   
   /* ---------- input handling ---------- */
   
@@ -126,6 +143,16 @@
   
   wireInput(el.fileInput);
   wireInput(el.cameraInput);
+
+  el.dropzone.addEventListener('click', () => el.fileInput.click());
+  el.dropzone.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); el.fileInput.click(); }
+  });
+
+  document.addEventListener('paste', e => {
+    const item = [...(e.clipboardData?.items || [])].find(i => i.type.startsWith('image/'));
+    if (item) handleFile(item.getAsFile());
+  });
   
   ['dragenter', 'dragover'].forEach(evt =>
     el.viewer.addEventListener(evt, e => {
@@ -203,6 +230,7 @@
     el.scan.hidden = false;
     el.downloadBtn.disabled = true;
     el.readout.hidden = true;
+    el.legend.hidden = true;
     // Any depth map already on screen belongs to a previous photo. Hide it
     // now rather than leave it visible (and wrongly implied to match the
     // new photo) while this request is in flight or if it fails.
@@ -241,8 +269,10 @@
       if (data.metric && data.depth_min_m != null && data.depth_max_m != null) {
         el.mRange.textContent = `${data.depth_min_m.toFixed(2)}\u2013${data.depth_max_m.toFixed(2)} m`;
         el.rangeRow.hidden = false;
+        updateLegend([data.depth_min_m, data.depth_max_m]);
       } else {
         el.rangeRow.hidden = true;
+        updateLegend(null);
       }
       el.readout.hidden = false;
       el.downloadBtn.disabled = false;
@@ -323,6 +353,7 @@
     r.addEventListener('change', () => {
       state.ramp = r.value;
       paint();
+      updateLegend();
     })
   );
   
@@ -423,6 +454,7 @@
       el.mDev.textContent = 'bundled';
       applyScaleMode(false);
       el.rangeRow.hidden = true;
+      updateLegend(null);
       el.readout.hidden = false;
       el.downloadBtn.disabled = false;
       setStatus(`Example: ${ex.label || ex.photo}. No GPU call was made.`, 'ok');
@@ -442,8 +474,17 @@
     a.click();
   });
   
-  /* ---------- first-run sanity check ---------- */
-  
-  if (CONFIG.ENDPOINT.includes('YOUR-WORKSPACE')) {
+  /* ---------- first-run checks ---------- */
+
+  // Only offer the example button when examples/ actually ships some.
+  fetch('examples/manifest.json')
+    .then(res => (res.ok ? res.json() : []))
+    .then(list => {
+      state.examples = Array.isArray(list) ? list : [];
+      el.exampleBtn.hidden = !state.examples.length;
+    })
+    .catch(() => { state.examples = []; });
+
+  if (!/\.modal\.run\//.test(CONFIG.ENDPOINT)) {
     setStatus('No endpoint configured yet. Set CONFIG.ENDPOINT in app.js.', 'error');
   }

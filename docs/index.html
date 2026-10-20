@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Monocular Depth Estimation — live demo</title>
+<meta name="description" content="Upload or shoot a photo and get a predicted depth map in metres, from a Stable Diffusion UNet fine-tuned on DIODE.">
+<meta property="og:title" content="Monocular Depth Estimation — live demo">
+<meta property="og:description" content="Metric depth from a single photograph, predicted by a fine-tuned diffusion model.">
+<meta name="theme-color" content="#0C0817">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%23FCE38A'/%3E%3Cstop offset='.5' stop-color='%23ED6925'/%3E%3Cstop offset='1' stop-color='%236A0F6E'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='7' fill='%230C0817'/%3E%3Crect x='7' y='7' width='18' height='18' rx='3' fill='url(%23g)'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="rail" aria-hidden="true">
+  <span class="rail-cap">near</span>
+  <span class="rail-ramp"></span>
+  <span class="rail-cap">far</span>
+</div>
+
+<nav class="topbar shell-wide" aria-label="Site">
+  <a class="brand" href="#top">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <span>depth<span class="brand-sep">/</span>estimation</span>
+  </a>
+  <div class="topbar-links">
+    <a href="#how">How it works</a>
+    <a href="#notes">Limits</a>
+    <a href="https://github.com/ahedmousa1-crypto/depth-estimation" class="topbar-gh">GitHub</a>
+  </div>
+</nav>
+
+<main class="shell" id="top">
+
+  <header class="masthead">
+    <p class="eyebrow">Monocular depth estimation</p>
+    <h1>Judging distance from <em>a single photograph.</em></h1>
+    <p class="standfirst">
+      A single photograph carries no direct measurement of distance. The model infers it
+      from the cues a person uses without thinking: things that overlap sit in front,
+      textures compress with range, parallel lines converge. Give it a picture and it
+      returns a prediction for every pixel.
+    </p>
+    <ul class="chips" aria-label="Model facts">
+      <li>Stable Diffusion 1.5 UNet</li>
+      <li>Fine-tuned on DIODE</li>
+      <li>Metric depth, in metres</li>
+    </ul>
+  </header>
+
+  <section class="stage" aria-label="Depth viewer">
+
+    <div class="viewer" id="viewer" data-state="empty">
+
+      <div class="dropzone" id="dropzone" role="button" tabindex="0"
+           aria-label="Choose a photo, or drop one here">
+        <div class="dropzone-inner">
+          <svg class="dz-mark" viewBox="0 0 48 48" aria-hidden="true">
+            <rect x="4" y="10" width="40" height="28" rx="3"/>
+            <circle cx="24" cy="24" r="8"/>
+            <circle cx="24" cy="24" r="3"/>
+          </svg>
+          <p class="dz-title">Drop a photo here</p>
+          <p class="dz-sub">click to browse · or paste with <kbd>Ctrl</kbd>+<kbd>V</kbd></p>
+        </div>
+      </div>
+
+      <div class="compare" id="compare" hidden>
+        <img id="sourceImg" alt="The photo you supplied" draggable="false">
+        <div class="depth-layer" id="depthLayer">
+          <canvas id="depthCanvas"></canvas>
+        </div>
+        <div class="wipe" id="wipeHandle" role="slider" tabindex="0"
+             aria-label="Wipe between photo and depth map"
+             aria-valuemin="0" aria-valuemax="100" aria-valuenow="50">
+          <span class="wipe-line"></span>
+          <span class="wipe-grip"></span>
+        </div>
+        <span class="corner-tag corner-left">photo</span>
+        <span class="corner-tag corner-right">depth</span>
+      </div>
+
+      <div class="scan" id="scan" hidden><span></span></div>
+
+    </div>
+
+    <div class="legend" id="legend" hidden>
+      <span class="legend-cap" id="legendNear">near</span>
+      <span class="legend-bar" id="legendBar"></span>
+      <span class="legend-cap" id="legendFar">far</span>
+    </div>
+
+    <p class="status" id="status" role="status" aria-live="polite">
+      <span class="dot" id="statusDot"></span><span id="statusText">Ready. Pick a photo to start.</span>
+    </p>
+
+    <div class="controls">
+      <div class="control-group">
+        <label class="btn btn-primary" for="fileInput">
+          Choose photo
+          <input type="file" id="fileInput" accept="image/*" hidden>
+        </label>
+        <label class="btn" for="cameraInput">
+          Take photo
+          <input type="file" id="cameraInput" accept="image/*" capture="environment" hidden>
+        </label>
+        <button class="btn" id="exampleBtn" type="button" hidden>Load an example</button>
+      </div>
+
+      <div class="control-group control-group-right">
+        <fieldset class="ramp-picker">
+          <legend>Colour ramp</legend>
+          <label><input type="radio" name="cmap" value="inferno" checked><span>Inferno</span></label>
+          <label><input type="radio" name="cmap" value="turbo"><span>Turbo</span></label>
+          <label><input type="radio" name="cmap" value="gray"><span>Grey</span></label>
+        </fieldset>
+        <button class="btn" id="downloadBtn" type="button" disabled>Save depth map</button>
+      </div>
+    </div>
+
+    <dl class="readout" id="readout" hidden>
+      <div><dt>Inference</dt><dd id="mInfer">—</dd></div>
+      <div><dt>Round trip</dt><dd id="mTotal">—</dd></div>
+      <div><dt>Resolution</dt><dd id="mRes">—</dd></div>
+      <div><dt>Device</dt><dd id="mDev">—</dd></div>
+      <div id="rangeRow" hidden><dt>Depth range</dt><dd id="mRange">—</dd></div>
+    </dl>
+
+  </section>
+
+  <section class="how" id="how">
+    <h2>How it works</h2>
+
+    <ol class="steps">
+      <li>
+        <span class="step-n">01</span>
+        <h3>Encode the photo</h3>
+        <p>
+          The frozen Stable Diffusion VAE compresses your photo into a latent. That latent
+          is the condition: it is concatenated to the UNet input, so the network always
+          sees the scene it is describing.
+        </p>
+      </li>
+      <li>
+        <span class="step-n">02</span>
+        <h3>Denoise a depth image</h3>
+        <p>
+          Starting from pure noise, the fine-tuned UNet runs DDIM sampling to produce a
+          depth image. Several samples with different seeds are averaged, which smooths
+          out the noise any single run leaves behind.
+        </p>
+      </li>
+      <li>
+        <span class="step-n">03</span>
+        <h3>Decode back to metres</h3>
+        <p>
+          The depth image is an ordinary RGB picture, so the VAE can decode it. A
+          bijective codec then turns each colour back into an exact distance, with no
+          per-image rescaling.
+        </p>
+      </li>
+    </ol>
+
+    <figure class="codec">
+      <figcaption>
+        <h3>The colour codec</h3>
+        <p>
+          Distance is warped by a power curve, then mapped onto a path through all eight
+          corners of the RGB cube. Near ranges get most of the colour, so a metre matters
+          more at 2&nbsp;m than at 50&nbsp;m. The mapping is invertible, which means the
+          model's output can be read back as real distance.
+        </p>
+      </figcaption>
+      <div class="codec-strip" aria-hidden="true"></div>
+      <ol class="codec-ticks" aria-label="Depth at positions along the codec">
+        <li style="--t:0">0&nbsp;m</li>
+        <li style="--t:.174">1</li>
+        <li style="--t:.306">2</li>
+        <li style="--t:.556">5</li>
+        <li style="--t:.75">10</li>
+        <li style="--t:.918">25</li>
+        <li style="--t:1">∞</li>
+      </ol>
+    </figure>
+  </section>
+
+  <section class="notes" id="notes">
+    <h2>Reading the output</h2>
+    <div class="notes-grid">
+      <article id="scaleNote">
+        <h3 id="scaleNoteTitle">It is relative, not metric</h3>
+        <p id="scaleNoteBody">
+          The model predicts inverse relative depth. Bright means nearer and dark means
+          further, but the scale is normalised per image. Nothing here tells you that a
+          chair is 2.3 metres away, and two different photos are not comparable to each
+          other. Absolute distance in metres requires a metric-trained variant.
+        </p>
+      </article>
+      <article>
+        <h3>Where it tends to fail</h3>
+        <p>
+          Mirrors and glass, because the cues describe the reflected scene rather than the
+          surface. Large flat walls with no texture. Heavy motion blur. Aerial or macro
+          framing far from the training distribution. Fine structures such as hair and
+          wire fencing usually smear.
+        </p>
+      </article>
+      <article>
+        <h3>What happens to your photo</h3>
+        <p>
+          It is sent to a GPU container, held in memory for the duration of inference and
+          discarded. Nothing is written to disk and nothing is stored. The container sleeps
+          when idle, which is why the first request after a quiet period takes longer.
+        </p>
+      </article>
+    </div>
+  </section>
+
+  <footer class="foot">
+    <p class="mono">Static front end on GitHub Pages · inference on a Modal GPU container</p>
+    <p class="mono foot-links">
+      <a href="https://github.com/ahedmousa1-crypto/depth-estimation">Source</a>
+      <a href="https://huggingface.co/ahd03/diode-depth-model-v2">Model</a>
+      <a href="https://huggingface.co/datasets/ahd03/diode-depth-3k">Dataset</a>
+    </p>
+  </footer>
+
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
